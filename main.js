@@ -1,12 +1,14 @@
-const { Plugin, PluginSettingTab, Setting, Notice, requestUrl } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, ItemView } = require('obsidian');
+
+const VIEW_TYPE_CHAT = 'claude-footprint-chat-view';
 
 const DEFAULT_SETTINGS = {
   apiKey: '',
   model: 'claude-sonnet-4-6',
-  footprintFolder: '',      // relative path within vault where daily notes live, "" = vault root
+  footprintFolder: '',
   chatFileName: 'claude.md',
-  maxDaysContext: 14,       // when no date is mentioned, use the N most recent daily notes
-  maxCharsPerNote: 12000    // safety cap per note to avoid oversized requests
+  maxDaysContext: 14,
+  maxCharsPerNote: 12000
 };
 
 const MONTHS = {
@@ -21,10 +23,18 @@ module.exports = class ClaudeFootprintPlugin extends Plugin {
     await this.loadSettings();
     this.addSettingTab(new ClaudeFootprintSettingTab(this.app, this));
 
+    this.registerView(VIEW_TYPE_CHAT, (leaf) => new ClaudeFootprintChatView(leaf, this));
+
+    this.addCommand({
+      id: 'open-claude-footprint-chat',
+      name: 'Open Claude Footprint chat',
+      callback: () => this.activateChatView()
+    });
+
     this.addCommand({
       id: 'ask-claude-footprint',
-      name: 'Ask Claude about my Footprint notes',
-      callback: () => this.handleAsk()
+      name: 'Ask Claude about my Footprint notes (via claude.md)',
+      callback: () => this.handleAskInNote()
     });
 
     this.addCommand({
@@ -33,114 +43,22 @@ module.exports = class ClaudeFootprintPlugin extends Plugin {
       callback: () => this.handleImport()
     });
 
-    this.addRibbonIcon('message-circle', 'Ask Claude Footprint', () => this.handleAsk());
+    this.addRibbonIcon('message-circle', 'Open Claude Footprint chat', () => this.activateChatView());
     this.addRibbonIcon('import', 'Import Claude export', () => this.handleImport());
   }
 
-  handleImport() {
-    // Uses a hidden native file input so the user gets a normal OS file
-    // picker — no terminal, no Node.js, no command line involved.
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json';
-    input.style.display = 'none';
-    document.body.appendChild(input);
-
-    input.onchange = async () => {
-      const file = input.files && input.files[0];
-      document.body.removeChild(input);
-      if (!file) return;
-
-      new Notice('Reading export file...');
-      try {
-        const text = await file.text();
-        await this.importConversations(text);
-      } catch (e) {
-        new Notice('Import failed: ' + e.message);
-        console.error('Claude Footprint import error:', e);
-      }
-    };
-
-    input.click();
+  onunload() {
+    this.app.workspace.detachLeavesOfType(VIEW_TYPE_CHAT);
   }
 
-  async importConversations(jsonText) {
-    let raw;
-    try {
-      raw = JSON.parse(jsonText);
-    } catch (e) {
-      throw new Error('That file is not valid JSON. Make sure you selected conversations.json from your Claude export.');
+  async activateChatView() {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(VIEW_TYPE_CHAT)[0];
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false);
+      await leaf.setViewState({ type: VIEW_TYPE_CHAT, active: true });
     }
-
-    const conversations = Array.isArray(raw) ? raw : (raw.conversations || []);
-    if (conversations.length === 0) {
-      throw new Error('No conversations found in this file. Make sure you selected conversations.json.');
-    }
-
-    const importedIndex = (await this.loadImportIndex());
-    const folderPath = this.settings.footprintFolder.replace(/^\/+|\/+$/g, '');
-
-    if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
-      await this.app.vault.createFolder(folderPath);
-    }
-
-    let filed = 0;
-    let skipped = 0;
-    const dayBuffers = {}; // date -> accumulated markdown for this run
-
-    for (const convo of conversations) {
-      const uuid = convo.uuid || convo.id;
-      if (!uuid) continue;
-
-      if (importedIndex[uuid]) {
-        skipped++;
-        continue;
-      }
-
-      const createdAt = convo.created_at || convo.updated_at;
-      if (!createdAt) continue;
-
-      const date = new Date(createdAt).toISOString().slice(0, 10);
-      const title = convo.name || '(untitled conversation)';
-      const messages = convo.chat_messages || convo.messages || [];
-
-      let block = `\n\n## ${title}\n*Started: ${formatTimestamp(createdAt)}*\n`;
-      for (const msg of messages) {
-        const sender = msg.sender === 'human' ? 'Human' : 'Claude';
-        const msgText = extractMessageText(msg);
-        if (!msgText) continue;
-        block += `\n**${sender}** (${formatTimestamp(msg.created_at)}):\n\n${msgText}\n`;
-      }
-
-      dayBuffers[date] = (dayBuffers[date] || '') + block;
-      importedIndex[uuid] = { date, title, filedAt: new Date().toISOString() };
-      filed++;
-    }
-
-    for (const [date, block] of Object.entries(dayBuffers)) {
-      const filePath = folderPath ? `${folderPath}/${date}.md` : `${date}.md`;
-      const existing = this.app.vault.getAbstractFileByPath(filePath);
-      if (existing) {
-        const current = await this.app.vault.read(existing);
-        await this.app.vault.modify(existing, current + block);
-      } else {
-        await this.app.vault.create(filePath, block.trimStart());
-      }
-    }
-
-    await this.saveImportIndex(importedIndex);
-    new Notice(`Import complete: filed ${filed} new conversation(s), skipped ${skipped} already-imported.`);
-  }
-
-  async loadImportIndex() {
-    const data = await this.loadData();
-    return (data && data.importIndex) || {};
-  }
-
-  async saveImportIndex(index) {
-    const data = (await this.loadData()) || {};
-    data.importIndex = index;
-    await this.saveData(data);
+    workspace.revealLeaf(leaf);
   }
 
   async loadSettings() {
@@ -148,51 +66,30 @@ module.exports = class ClaudeFootprintPlugin extends Plugin {
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    const data = (await this.loadData()) || {};
+    Object.assign(data, this.settings);
+    await this.saveData(data);
   }
 
-  async handleAsk() {
-    const file = this.app.vault.getAbstractFileByPath(this.settings.chatFileName);
-    if (!file) {
-      new Notice(`Could not find "${this.settings.chatFileName}" in your vault. Create it first.`);
-      return;
-    }
+  // ---------- Shared core: used by both the sidebar chat and the claude.md command ----------
 
-    const content = await this.app.vault.read(file);
-    const question = extractLastQuestion(content);
-    if (!question) {
-      new Notice('No question found. Write a question as the last line of the file, e.g. starting with ">> ".');
-      return;
-    }
-
+  async answerQuestion(question) {
     if (!this.settings.apiKey) {
-      new Notice('Set your Anthropic API key in Claude Footprint settings first.');
-      return;
+      throw new Error('Set your Anthropic API key in Claude Footprint settings first.');
     }
 
-    new Notice('Asking Claude...');
+    const dates = parseDatesFromText(question);
+    const { context, matchedFiles } = await this.gatherContext(dates);
 
-    try {
-      const dates = parseDatesFromText(question);
-      const { context, matchedFiles } = await this.gatherContext(dates);
-
-      if (matchedFiles.length === 0) {
-        const updated = content.trimEnd() +
-          `\n\n**Claude:** I couldn't find any daily notes matching that request in "${this.settings.footprintFolder || '(vault root)'}". Check the folder setting and that your daily notes are named with a date (e.g. 2026-06-30.md).\n\n---\n`;
-        await this.app.vault.modify(file, updated);
-        new Notice('No matching notes found.');
-        return;
-      }
-
-      const answer = await this.callClaude(question, context);
-      const sourcesLine = `*Sources: ${matchedFiles.map(f => f.name).join(', ')}*`;
-      const updated = content.trimEnd() + `\n\n**Claude:** ${answer}\n\n${sourcesLine}\n\n---\n`;
-      await this.app.vault.modify(file, updated);
-      new Notice('Answer added to ' + this.settings.chatFileName);
-    } catch (e) {
-      new Notice('Error: ' + e.message);
-      console.error('Claude Footprint error:', e);
+    if (matchedFiles.length === 0) {
+      return {
+        answer: `I couldn't find any daily notes matching that in "${this.settings.footprintFolder || '(vault root)'}". Check the folder setting and that your daily notes are named with a date (e.g. 2026-06-30.md).`,
+        sources: []
+      };
     }
+
+    const answer = await this.callClaude(question, context);
+    return { answer, sources: matchedFiles.map(f => f.name) };
   }
 
   async gatherContext(dates) {
@@ -257,10 +154,219 @@ module.exports = class ClaudeFootprintPlugin extends Plugin {
       throw new Error(msg);
     }
 
-    const data = response.json;
-    return data.content.map(c => c.text || '').join('\n').trim();
+    return response.json.content.map(c => c.text || '').join('\n').trim();
+  }
+
+  // ---------- claude.md flow (kept for anyone who prefers writing in a note) ----------
+
+  async handleAskInNote() {
+    const file = this.app.vault.getAbstractFileByPath(this.settings.chatFileName);
+    if (!file) {
+      new Notice(`Could not find "${this.settings.chatFileName}" in your vault. Create it first.`);
+      return;
+    }
+
+    const content = await this.app.vault.read(file);
+    const question = extractLastQuestion(content);
+    if (!question) {
+      new Notice('No question found. Write a question as the last line of the file, e.g. starting with ">> ".');
+      return;
+    }
+
+    new Notice('Asking Claude...');
+    try {
+      const { answer, sources } = await this.answerQuestion(question);
+      const sourcesLine = sources.length ? `\n\n*Sources: ${sources.join(', ')}*` : '';
+      const updated = content.trimEnd() + `\n\n**Claude:** ${answer}${sourcesLine}\n\n---\n`;
+      await this.app.vault.modify(file, updated);
+      new Notice('Answer added to ' + this.settings.chatFileName);
+    } catch (e) {
+      new Notice('Error: ' + e.message);
+      console.error('Claude Footprint error:', e);
+    }
+  }
+
+  // ---------- Import flow ----------
+
+  handleImport() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+
+    input.onchange = async () => {
+      const file = input.files && input.files[0];
+      document.body.removeChild(input);
+      if (!file) return;
+
+      new Notice('Reading export file...');
+      try {
+        const text = await file.text();
+        await this.importConversations(text);
+      } catch (e) {
+        new Notice('Import failed: ' + e.message);
+        console.error('Claude Footprint import error:', e);
+      }
+    };
+
+    input.click();
+  }
+
+  async importConversations(jsonText) {
+    let raw;
+    try {
+      raw = JSON.parse(jsonText);
+    } catch (e) {
+      throw new Error('That file is not valid JSON. Make sure you selected conversations.json from your Claude export.');
+    }
+
+    const conversations = Array.isArray(raw) ? raw : (raw.conversations || []);
+    if (conversations.length === 0) {
+      throw new Error('No conversations found in this file. Make sure you selected conversations.json.');
+    }
+
+    const importedIndex = await this.loadImportIndex();
+    const folderPath = this.settings.footprintFolder.replace(/^\/+|\/+$/g, '');
+
+    if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
+      await this.app.vault.createFolder(folderPath);
+    }
+
+    let filed = 0;
+    let skipped = 0;
+    const dayBuffers = {};
+
+    for (const convo of conversations) {
+      const uuid = convo.uuid || convo.id;
+      if (!uuid) continue;
+
+      if (importedIndex[uuid]) {
+        skipped++;
+        continue;
+      }
+
+      const createdAt = convo.created_at || convo.updated_at;
+      if (!createdAt) continue;
+
+      const date = new Date(createdAt).toISOString().slice(0, 10);
+      const title = convo.name || '(untitled conversation)';
+      const messages = convo.chat_messages || convo.messages || [];
+
+      let block = `\n\n## ${title}\n*Started: ${formatTimestamp(createdAt)}*\n`;
+      for (const msg of messages) {
+        const sender = msg.sender === 'human' ? 'Human' : 'Claude';
+        const msgText = extractMessageText(msg);
+        if (!msgText) continue;
+        block += `\n**${sender}** (${formatTimestamp(msg.created_at)}):\n\n${msgText}\n`;
+      }
+
+      dayBuffers[date] = (dayBuffers[date] || '') + block;
+      importedIndex[uuid] = { date, title, filedAt: new Date().toISOString() };
+      filed++;
+    }
+
+    for (const [date, block] of Object.entries(dayBuffers)) {
+      const filePath = folderPath ? `${folderPath}/${date}.md` : `${date}.md`;
+      const existing = this.app.vault.getAbstractFileByPath(filePath);
+      if (existing) {
+        const current = await this.app.vault.read(existing);
+        await this.app.vault.modify(existing, current + block);
+      } else {
+        await this.app.vault.create(filePath, block.trimStart());
+      }
+    }
+
+    await this.saveImportIndex(importedIndex);
+    new Notice(`Import complete: filed ${filed} new conversation(s), skipped ${skipped} already-imported.`);
+  }
+
+  async loadImportIndex() {
+    const data = await this.loadData();
+    return (data && data.importIndex) || {};
+  }
+
+  async saveImportIndex(index) {
+    const data = (await this.loadData()) || {};
+    data.importIndex = index;
+    await this.saveData(data);
   }
 };
+
+// ---------- Sidebar chat view ----------
+
+class ClaudeFootprintChatView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.history = [];
+  }
+
+  getViewType() { return VIEW_TYPE_CHAT; }
+  getDisplayText() { return 'Claude Footprint'; }
+  getIcon() { return 'message-circle'; }
+
+  async onOpen() {
+    const container = this.containerEl.children[1];
+    container.empty();
+    container.addClass('claude-footprint-chat-container');
+
+    this.messagesEl = container.createDiv({ cls: 'cf-messages' });
+
+    const inputRow = container.createDiv({ cls: 'cf-input-row' });
+    this.textarea = inputRow.createEl('textarea', {
+      cls: 'cf-textarea',
+      attr: { placeholder: 'Ask about your Claude Footprint notes... (Enter to send, Shift+Enter for newline)' }
+    });
+    this.sendButton = inputRow.createEl('button', { text: 'Send', cls: 'cf-send-btn' });
+
+    this.sendButton.onclick = () => this.send();
+    this.textarea.addEventListener('keydown', (evt) => {
+      if (evt.key === 'Enter' && !evt.shiftKey) {
+        evt.preventDefault();
+        this.send();
+      }
+    });
+
+    this.renderMessages();
+  }
+
+  async onClose() {}
+
+  renderMessages() {
+    this.messagesEl.empty();
+    for (const msg of this.history) {
+      const bubble = this.messagesEl.createDiv({ cls: `cf-bubble cf-${msg.role}` });
+      bubble.createDiv({ cls: 'cf-bubble-text', text: msg.text });
+      if (msg.sources && msg.sources.length) {
+        bubble.createDiv({ cls: 'cf-sources', text: `Sources: ${msg.sources.join(', ')}` });
+      }
+    }
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+
+  async send() {
+    const question = this.textarea.value.trim();
+    if (!question) return;
+
+    this.textarea.value = '';
+    this.history.push({ role: 'user', text: question });
+    this.history.push({ role: 'assistant', text: 'Thinking...', pending: true });
+    this.renderMessages();
+
+    try {
+      const { answer, sources } = await this.plugin.answerQuestion(question);
+      this.history[this.history.length - 1] = { role: 'assistant', text: answer, sources };
+    } catch (e) {
+      this.history[this.history.length - 1] = { role: 'assistant', text: 'Error: ' + e.message };
+      console.error('Claude Footprint error:', e);
+    }
+
+    this.renderMessages();
+  }
+}
+
+// ---------- Shared helpers ----------
 
 function extractLastQuestion(content) {
   const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
@@ -396,7 +502,7 @@ class ClaudeFootprintSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Chat file name')
-      .setDesc('The note you write questions in and get answers back in.')
+      .setDesc('Used only by the "Ask via claude.md" command, not the sidebar chat panel.')
       .addText(text => text
         .setValue(this.plugin.settings.chatFileName)
         .onChange(async (value) => {

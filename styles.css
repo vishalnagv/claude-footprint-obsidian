@@ -1,1 +1,70 @@
-/* Claude Footprint plugin - no custom styling needed currently */
+.claude-footprint-chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 8px;
+}
+
+.cf-messages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+
+.cf-bubble {
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-width: 92%;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.cf-bubble.cf-user {
+  align-self: flex-end;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.cf-bubble.cf-assistant {
+  align-self: flex-start;
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+}
+
+.cf-bubble-text {
+  font-size: var(--font-text-size);
+}
+
+.cf-sources {
+  margin-top: 6px;
+  font-size: var(--font-smallest);
+  opacity: 0.7;
+}
+
+.cf-input-row {
+  display: flex;
+  gap: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 8px;
+}
+
+.cf-textarea {
+  flex: 1;
+  resize: none;
+  min-height: 44px;
+  max-height: 140px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  color: var(--text-normal);
+  font-family: inherit;
+  font-size: var(--font-text-size);
+}
+
+.cf-send-btn {
+  align-self: flex-end;
+}
