@@ -27,7 +27,120 @@ module.exports = class ClaudeFootprintPlugin extends Plugin {
       callback: () => this.handleAsk()
     });
 
+    this.addCommand({
+      id: 'import-claude-export',
+      name: 'Import Claude export (conversations.json)',
+      callback: () => this.handleImport()
+    });
+
     this.addRibbonIcon('message-circle', 'Ask Claude Footprint', () => this.handleAsk());
+    this.addRibbonIcon('import', 'Import Claude export', () => this.handleImport());
+  }
+
+  handleImport() {
+    // Uses a hidden native file input so the user gets a normal OS file
+    // picker — no terminal, no Node.js, no command line involved.
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+
+    input.onchange = async () => {
+      const file = input.files && input.files[0];
+      document.body.removeChild(input);
+      if (!file) return;
+
+      new Notice('Reading export file...');
+      try {
+        const text = await file.text();
+        await this.importConversations(text);
+      } catch (e) {
+        new Notice('Import failed: ' + e.message);
+        console.error('Claude Footprint import error:', e);
+      }
+    };
+
+    input.click();
+  }
+
+  async importConversations(jsonText) {
+    let raw;
+    try {
+      raw = JSON.parse(jsonText);
+    } catch (e) {
+      throw new Error('That file is not valid JSON. Make sure you selected conversations.json from your Claude export.');
+    }
+
+    const conversations = Array.isArray(raw) ? raw : (raw.conversations || []);
+    if (conversations.length === 0) {
+      throw new Error('No conversations found in this file. Make sure you selected conversations.json.');
+    }
+
+    const importedIndex = (await this.loadImportIndex());
+    const folderPath = this.settings.footprintFolder.replace(/^\/+|\/+$/g, '');
+
+    if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
+      await this.app.vault.createFolder(folderPath);
+    }
+
+    let filed = 0;
+    let skipped = 0;
+    const dayBuffers = {}; // date -> accumulated markdown for this run
+
+    for (const convo of conversations) {
+      const uuid = convo.uuid || convo.id;
+      if (!uuid) continue;
+
+      if (importedIndex[uuid]) {
+        skipped++;
+        continue;
+      }
+
+      const createdAt = convo.created_at || convo.updated_at;
+      if (!createdAt) continue;
+
+      const date = new Date(createdAt).toISOString().slice(0, 10);
+      const title = convo.name || '(untitled conversation)';
+      const messages = convo.chat_messages || convo.messages || [];
+
+      let block = `\n\n## ${title}\n*Started: ${formatTimestamp(createdAt)}*\n`;
+      for (const msg of messages) {
+        const sender = msg.sender === 'human' ? 'Human' : 'Claude';
+        const msgText = extractMessageText(msg);
+        if (!msgText) continue;
+        block += `\n**${sender}** (${formatTimestamp(msg.created_at)}):\n\n${msgText}\n`;
+      }
+
+      dayBuffers[date] = (dayBuffers[date] || '') + block;
+      importedIndex[uuid] = { date, title, filedAt: new Date().toISOString() };
+      filed++;
+    }
+
+    for (const [date, block] of Object.entries(dayBuffers)) {
+      const filePath = folderPath ? `${folderPath}/${date}.md` : `${date}.md`;
+      const existing = this.app.vault.getAbstractFileByPath(filePath);
+      if (existing) {
+        const current = await this.app.vault.read(existing);
+        await this.app.vault.modify(existing, current + block);
+      } else {
+        await this.app.vault.create(filePath, block.trimStart());
+      }
+    }
+
+    await this.saveImportIndex(importedIndex);
+    new Notice(`Import complete: filed ${filed} new conversation(s), skipped ${skipped} already-imported.`);
+  }
+
+  async loadImportIndex() {
+    const data = await this.loadData();
+    return (data && data.importIndex) || {};
+  }
+
+  async saveImportIndex(index) {
+    const data = (await this.loadData()) || {};
+    data.importIndex = index;
+    await this.saveData(data);
   }
 
   async loadSettings() {
@@ -162,6 +275,32 @@ function extractLastQuestion(content) {
 
 function fmt(d) {
   return d.toISOString().slice(0, 10);
+}
+
+function formatTimestamp(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+}
+
+function extractMessageText(message) {
+  if (typeof message.text === 'string' && message.text.length > 0) {
+    return message.text;
+  }
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map(block => {
+        if (typeof block === 'string') return block;
+        if (block.type === 'text' && block.text) return block.text;
+        if (block.type === 'tool_use') return `[used tool: ${block.name || 'unknown'}]`;
+        if (block.type === 'tool_result') return '[tool result omitted]';
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return '';
 }
 
 function parseDatesFromText(text) {
