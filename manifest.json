@@ -1,0 +1,10 @@
+{
+  "id": "claude-footprint",
+  "name": "Claude Footprint",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Ask Claude to analyze your daily Claude.ai chat export notes, right from your vault.",
+  "author": "You",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
